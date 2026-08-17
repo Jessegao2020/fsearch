@@ -161,6 +161,144 @@ get_query_text(FsearchApplicationWindow *win) {
     return gtk_entry_get_text(GTK_ENTRY(win->search_entry));
 }
 
+#define SEARCH_ENTRY_UNDO_MAX_STATES 50
+#define SEARCH_ENTRY_UNDO_GROUP_DELAY_MS 800
+#define SEARCH_ENTRY_UNDO_STATE_KEY "fsearch-search-entry-undo-state"
+
+typedef struct {
+    GPtrArray *undo_stack;
+    GPtrArray *redo_stack;
+    char *current_text;
+    guint group_timeout_id;
+    gboolean applying;
+} SearchEntryUndoState;
+
+static gboolean
+search_entry_undo_group_timeout_cb(gpointer user_data) {
+    SearchEntryUndoState *state = user_data;
+    state->group_timeout_id = 0;
+    return G_SOURCE_REMOVE;
+}
+
+static void
+search_entry_undo_finish_group(SearchEntryUndoState *state) {
+    if (state->group_timeout_id) {
+        g_source_remove(state->group_timeout_id);
+        state->group_timeout_id = 0;
+    }
+}
+
+static void
+search_entry_undo_state_free(gpointer data) {
+    SearchEntryUndoState *state = data;
+    if (!state) {
+        return;
+    }
+
+    search_entry_undo_finish_group(state);
+    g_clear_pointer(&state->undo_stack, g_ptr_array_unref);
+    g_clear_pointer(&state->redo_stack, g_ptr_array_unref);
+    g_clear_pointer(&state->current_text, g_free);
+    g_free(state);
+}
+
+static SearchEntryUndoState *
+search_entry_undo_get_state(FsearchApplicationWindow *win) {
+    return g_object_get_data(G_OBJECT(win->search_entry), SEARCH_ENTRY_UNDO_STATE_KEY);
+}
+
+static void
+search_entry_undo_push(GPtrArray *stack, const char *text) {
+    const char *value = text ? text : "";
+
+    if (stack->len > 0) {
+        const char *last = g_ptr_array_index(stack, stack->len - 1);
+        if (g_strcmp0(last, value) == 0) {
+            return;
+        }
+    }
+
+    g_ptr_array_add(stack, g_strdup(value));
+
+    if (stack->len > SEARCH_ENTRY_UNDO_MAX_STATES) {
+        g_ptr_array_remove_index(stack, 0);
+    }
+}
+
+static void
+search_entry_undo_init(FsearchApplicationWindow *win) {
+    SearchEntryUndoState *state = g_new0(SearchEntryUndoState, 1);
+    state->undo_stack = g_ptr_array_new_with_free_func(g_free);
+    state->redo_stack = g_ptr_array_new_with_free_func(g_free);
+    state->current_text = g_strdup(get_query_text(win));
+
+    g_object_set_data_full(G_OBJECT(win->search_entry),
+                           SEARCH_ENTRY_UNDO_STATE_KEY,
+                           state,
+                           search_entry_undo_state_free);
+}
+
+static void
+search_entry_undo_record_change(FsearchApplicationWindow *win) {
+    SearchEntryUndoState *state = search_entry_undo_get_state(win);
+    if (!state) {
+        return;
+    }
+
+    const char *text = get_query_text(win);
+    if (g_strcmp0(state->current_text, text) == 0) {
+        return;
+    }
+
+    if (state->applying) {
+        g_free(state->current_text);
+        state->current_text = g_strdup(text);
+        return;
+    }
+
+    if (!state->group_timeout_id) {
+        search_entry_undo_push(state->undo_stack, state->current_text);
+        g_ptr_array_set_size(state->redo_stack, 0);
+    }
+
+    g_free(state->current_text);
+    state->current_text = g_strdup(text);
+
+    search_entry_undo_finish_group(state);
+    state->group_timeout_id = g_timeout_add(SEARCH_ENTRY_UNDO_GROUP_DELAY_MS,
+                                             search_entry_undo_group_timeout_cb,
+                                             state);
+}
+
+static gboolean
+search_entry_undo_apply(FsearchApplicationWindow *win, gboolean redo) {
+    SearchEntryUndoState *state = search_entry_undo_get_state(win);
+    if (!state) {
+        return FALSE;
+    }
+
+    GPtrArray *source = redo ? state->redo_stack : state->undo_stack;
+    GPtrArray *destination = redo ? state->undo_stack : state->redo_stack;
+
+    if (source->len == 0) {
+        return FALSE;
+    }
+
+    search_entry_undo_finish_group(state);
+    search_entry_undo_push(destination, state->current_text);
+
+    const guint last_index = source->len - 1;
+    g_autofree char *replacement = g_strdup(g_ptr_array_index(source, last_index));
+    g_ptr_array_remove_index(source, last_index);
+
+    state->applying = TRUE;
+    gtk_entry_set_text(GTK_ENTRY(win->search_entry), replacement);
+    gtk_editable_set_position(GTK_EDITABLE(win->search_entry), -1);
+    state->applying = FALSE;
+
+    return TRUE;
+}
+
 #define SEARCH_HISTORY_MAX_ITEMS 30
 #define SEARCH_HISTORY_RECORD_DELAY_MS 1200
 
@@ -1178,6 +1316,8 @@ on_search_entry_changed(GtkEntry *entry, gpointer user_data) {
     FsearchApplicationWindow *win = user_data;
     g_assert(FSEARCH_IS_APPLICATION_WINDOW(win));
 
+    search_entry_undo_record_change(win);
+
     FsearchConfig *config = fsearch_application_get_config(FSEARCH_APPLICATION_DEFAULT);
 
     if (config->search_as_you_type) {
@@ -1537,7 +1677,8 @@ fsearch_application_window_init(FsearchApplicationWindow *self) {
     g_assert(FSEARCH_IS_APPLICATION_WINDOW(self));
 
     gtk_widget_init_template(GTK_WIDGET(self));
-    
+
+    search_entry_undo_init(self);
     search_history_init(self);
 
     g_signal_connect(self,
@@ -1591,7 +1732,29 @@ static gboolean
 on_search_entry_key_press_event(GtkWidget *widget, GdkEvent *event, gpointer user_data) {
     FsearchApplicationWindow *win = user_data;
     guint keyval;
+    GdkModifierType state;
+    const GdkModifierType default_modifiers = gtk_accelerator_get_default_mod_mask();
+
     gdk_event_get_keyval(event, &keyval);
+    gdk_event_get_state(event, &state);
+
+    const GdkModifierType modifiers = state & default_modifiers;
+    const guint lower_keyval = gdk_keyval_to_lower(keyval);
+
+    if (lower_keyval == GDK_KEY_z &&
+        (modifiers == GDK_CONTROL_MASK ||
+         modifiers == (GDK_CONTROL_MASK | GDK_SHIFT_MASK))) {
+        const gboolean redo = (modifiers & GDK_SHIFT_MASK) != 0;
+        if (search_entry_undo_apply(win, redo)) {
+            return GDK_EVENT_STOP;
+        }
+    }
+    else if (lower_keyval == GDK_KEY_y && modifiers == GDK_CONTROL_MASK) {
+        if (search_entry_undo_apply(win, TRUE)) {
+            return GDK_EVENT_STOP;
+        }
+    }
+
     if (keyval == GDK_KEY_Down) {
         const gint cursor_idx = fsearch_list_view_get_cursor(win->result_view->list_view);
         gtk_widget_grab_focus(GTK_WIDGET(win->result_view->list_view));
